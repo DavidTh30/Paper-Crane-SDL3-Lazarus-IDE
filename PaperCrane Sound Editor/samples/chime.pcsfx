@@ -1,0 +1,23 @@
+PCSFX 1
+name=lantern
+wave=bell
+freq=1047
+freqend=1047
+curve=1
+attack=0.002000000095
+sustain=0.01999999955
+release=0.5
+punch=0
+vibdepth=0
+vibrate=6
+duty=0.5
+noise=0
+lowpass=1
+highpass=0
+arpmul=1.25999999
+arptime=0.1199999973
+repeats=1
+repeatgap=-0.400000006
+echo=0.25
+echodelay=0.1199999973
+volume=0.8000000119

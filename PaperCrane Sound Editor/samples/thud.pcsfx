@@ -1,0 +1,23 @@
+PCSFX 1
+name=hit
+wave=noise
+freq=200
+freqend=60
+curve=1
+attack=0.002000000095
+sustain=0.05000000075
+release=0.3000000119
+punch=0.6000000238
+vibdepth=0
+vibrate=6
+duty=0.5
+noise=0
+lowpass=0.6000000238
+highpass=0
+arpmul=1
+arptime=0
+repeats=0
+repeatgap=0.1000000015
+echo=0
+echodelay=0.1199999973
+volume=0.8000000119
