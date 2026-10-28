@@ -1,0 +1,695 @@
+unit uSDLView;
+
+{ SDL3 window with a vsync'ed render loop, driven from the LCL idle loop so the
+  SDL window runs on the LCL main thread (no other window: PaperCraneGamePlay).
+
+  Each pass of the loop:
+    1. poll SDL events (keys, close, resize)
+    2. wait for the bands the workers rendered during the previous pass
+    3. re-cut the static parts when the window size changed
+    4. upload the finished bands into one streaming texture
+       (SDL_UpdateTexture per band, SDL_PIXELFORMAT_ARGB8888 = TBGRAPixel bytes)
+    5. advance the animation and start the next frame on all physical cores
+    6. draw the texture and SDL_RenderPresent; with vsync on this blocks until
+       the display refresh while the workers are already rendering.
+  So the CPU rendering hides behind the vsync wait and the main thread never
+  draws pixels itself. }
+
+{$mode objfpc}{$H+}
+
+interface
+
+uses
+  Classes, SysUtils, StrUtils, Math, Forms, Controls, SDL3, BGRABitmap, BGRABitmapTypes,
+  uRenderPool, uGameScene, uFrameRenderer;
+
+type
+
+  { TSDLView }
+
+  TSDLView = class
+  private
+    FWin: PSDL_Window;
+    FRen: PSDL_Renderer;
+    FTex: PSDL_Texture;
+    FTexW, FTexH: Integer;
+    FFlipV: Boolean;
+    FScene: TGameScene;
+    FRenderer: TFrameRenderer;
+    FRunning, FHaveFrame, FFresh: Boolean;
+    FPaused, FFullScreen, FDirty, FSaveRequested, FVSync: Boolean;
+    FLastUpdate, FLastSwap: Double;
+    FBenchSecs, FBenchT0: Double;  // --bench=SECONDS: frame pacing report, then quit
+    FBench: array of Single;
+    procedure AppIdle(Sender: TObject; var Done: Boolean);
+    procedure PollEvents;
+    procedure HandleKey(AKey: TSDL_Keycode);
+    procedure GameKey(Code: Integer);
+    procedure MouseEvent(Kind: Integer; X, Y: Single);
+    procedure ApplySceneRequests;
+    procedure ApplyVSync;
+    procedure UpdateRefreshRate;
+    procedure UploadFrame;
+    procedure Present;
+    procedure DoSave;
+    procedure SetPaused(AValue: Boolean);
+    procedure BenchFrame(ANow, AInterval: Double);
+    procedure WriteBenchReport;
+  public
+    FrameCount, MissedFrames: Int64;
+    Fps, RefreshHz: Double;
+    LastWaitMs, LastUploadMs, LastSwapMs, LastUpdateMs, LastInterval: Double;
+    GLVendor, GLRenderer, GLVersion: string;  // SDL version, render backend, method
+    GLExtCount: Integer;                      // render drivers available
+    VSyncSupported: Boolean;
+    SwapIntervalNow: Integer;
+    LastSaved: string;
+    Exporting: Boolean;  // an export runs: the live loop stops, all cores go to it
+    constructor Create;
+    destructor Destroy; override;
+    procedure ToggleFullScreen;
+    procedure ToggleCaption;
+    procedure RequestSave;
+    procedure Redraw;  // re-render even when paused (layer switches etc.)
+    procedure SelectMode(AMode: Integer);
+    procedure SelectSeason(ASeason: Integer);
+    procedure SetVSync(AValue: Boolean);
+    procedure SetThreads(N: Integer);
+    procedure SetBandsPerThread(N: Integer);
+    procedure SetAdaptive(AValue: Boolean);
+    procedure ResetStats;
+    function Left: Integer;
+    function Top: Integer;
+    function Width: Integer;
+    function Height: Integer;
+    property Scene: TGameScene read FScene;
+    property Renderer: TFrameRenderer read FRenderer;
+    property Paused: Boolean read FPaused write SetPaused;
+    property VSync: Boolean read FVSync write SetVSync;
+    property FullScreen: Boolean read FFullScreen;
+    property TexW: Integer read FTexW;
+    property TexH: Integer read FTexH;
+  end;
+
+var
+  View: TSDLView;
+
+implementation
+
+uses
+  uAudio;
+
+function SDLErr: string;
+begin
+  Result := StrPas(SDL_GetError);
+end;
+
+constructor TSDLView.Create;
+var
+  R: TSDL_Rect;
+  Ver, I: Integer;
+begin
+  inherited Create;
+  if not SDL_Init(SDL_INIT_VIDEO) then
+    raise Exception.Create('SDL_Init failed: ' + SDLErr);
+  FWin := SDL_CreateWindow('Paper Crane',
+    1024, 576, SDL_WINDOW_RESIZABLE or SDL_WINDOW_HIGH_PIXEL_DENSITY);
+  if FWin = nil then raise Exception.Create('SDL_CreateWindow failed: ' + SDLErr);
+  if SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay, @R) then
+    SDL_SetWindowPosition(FWin, R.x + 40, R.y + 40);
+  FRen := SDL_CreateRenderer(FWin, nil);
+  if FRen = nil then raise Exception.Create('SDL_CreateRenderer failed: ' + SDLErr);
+  SDL_StartTextInput(FWin);   // player names are typed in the game window
+
+  Ver := SDL_GetVersion;
+  GLVendor := Format('SDL %d.%d.%d', [Ver div 1000000, (Ver div 1000) mod 1000, Ver mod 1000]);
+  GLRenderer := StrPas(SDL_GetRendererName(FRen));
+  GLVersion := 'SDL_Renderer, streaming texture, SDL_RenderPresent';
+  GLExtCount := SDL_GetNumRenderDrivers;
+  for I := 0 to GLExtCount - 1 do
+    GLVersion := GLVersion + IfThen(I = 0, '  (drivers: ', ', ') + StrPas(SDL_GetRenderDriver(I));
+  if GLExtCount > 0 then GLVersion := GLVersion + ')';
+  VSyncSupported := True;
+  FVSync := True;
+  RefreshHz := 60;
+  ApplyVSync;
+  UpdateRefreshRate;
+
+  FScene := TGameScene.Create;
+  FRenderer := TFrameRenderer.Create(FScene, PhysicalCores, 1);
+  // sound: the mixer opens now, the music is composed in the background
+  Audio := TAudio.Create;
+  FRunning := True;
+  FLastUpdate := HiResMs;
+  FLastSwap := FLastUpdate;
+  for I := 1 to ParamCount do
+  begin
+    if Pos('--bench=', ParamStr(I)) = 1 then
+      FBenchSecs := StrToFloatDef(Copy(ParamStr(I), 9, 20), 10);
+    if Pos('--mode=', ParamStr(I)) = 1 then
+      case LowerCase(Copy(ParamStr(I), 8, 20)) of
+        'morning': FScene.SetModeInstant(0);
+        'day': FScene.SetModeInstant(1);
+        'night': FScene.SetModeInstant(2);
+        'auto': FScene.AutoCycle := True;
+      end;
+    if Pos('--season=', ParamStr(I)) = 1 then
+      case LowerCase(Copy(ParamStr(I), 10, 20)) of
+        'summer': FScene.SetSeason(0, False);
+        'rainy', 'rain': FScene.SetSeason(1, False);
+        'autumn', 'fall': FScene.SetSeason(2, False);
+        'winter': FScene.SetSeason(3, False);
+      end;
+    if (ParamStr(I) = '--map') and (I < ParamCount) then
+      FScene.StartMapFile(ExpandFileName(ParamStr(I + 1)));
+    if Pos('--theme=', ParamStr(I)) = 1 then
+    begin
+      FScene.ThemeChoice := EnsureRange(StrToIntDef(Copy(ParamStr(I), 9, 3), 0), 0, 5) + 1;
+      FScene.SetTheme(FScene.ThemeChoice - 1, False);
+    end;
+    if Pos('--char=', ParamStr(I)) = 1 then
+      FScene.Character := EnsureRange(StrToIntDef(Copy(ParamStr(I), 8, 3), 0), 0, 4);
+    if ParamStr(I) = '--novsync' then
+      SetVSync(False);  // measure the top speed
+  end;
+  if FBenchSecs <= 0 then ApplySceneRequests;  // full screen / vsync from the saved settings
+  Application.AddOnIdleHandler(@AppIdle);
+end;
+
+destructor TSDLView.Destroy;
+begin
+  Application.RemoveOnIdleHandler(@AppIdle);
+  FreeAndNil(FRenderer);  // waits for the workers
+  FreeAndNil(Audio);      // stops the audio callback
+  FreeAndNil(FScene);
+  if FTex <> nil then SDL_DestroyTexture(FTex);
+  if FRen <> nil then SDL_DestroyRenderer(FRen);
+  if FWin <> nil then SDL_DestroyWindow(FWin);
+  SDL_Quit;
+  inherited Destroy;
+end;
+
+{ ---------- SDL ---------- }
+
+procedure TSDLView.ApplyVSync;
+var
+  V: LongInt;
+begin
+  SDL_SetRenderVSync(FRen, Ord(FVSync));
+  V := 0;
+  SDL_GetRenderVSync(FRen, @V);
+  SwapIntervalNow := V;
+end;
+
+procedure TSDLView.UpdateRefreshRate;
+var
+  Mode: PSDL_DisplayMode;
+begin
+  Mode := SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(FWin));
+  if (Mode <> nil) and (Mode^.refresh_rate > 1) then
+    RefreshHz := Mode^.refresh_rate;
+end;
+
+procedure TSDLView.HandleKey(AKey: TSDL_Keycode);
+begin
+  // a name is being typed: the letters come as text, only these keys count
+  if FScene.TextEntry then
+  begin
+    case AKey of
+      SDLK_RETURN, SDLK_KP_ENTER: GameKey(gkOk);
+      SDLK_ESCAPE: GameKey(gkBack);
+      SDLK_BACKSPACE: GameKey(gkErase);
+      SDLK_UP: GameKey(gkUp);
+      SDLK_DOWN: GameKey(gkDown);
+    end;
+    Exit;
+  end;
+  case AKey of
+    // game keys: the scene decides (flap while flying, navigate in the menus)
+    SDLK_SPACE: GameKey(gkFlap);
+    SDLK_UP, SDLK_W: GameKey(gkUp);
+    SDLK_DOWN: GameKey(gkDown);
+    SDLK_LEFT: GameKey(gkLeft);
+    SDLK_RIGHT: GameKey(gkRight);
+    SDLK_RETURN, SDLK_KP_ENTER: GameKey(gkOk);
+    SDLK_ESCAPE, SDLK_P: GameKey(gkBack);
+    SDLK_BACKSPACE: GameKey(gkErase);
+    SDLK_V:
+      begin
+        VSync := not VSync;
+        FScene.VSyncWanted := VSync;
+      end;
+    SDLK_F11: ToggleFullScreen;
+    SDLK_S: RequestSave;
+    SDLK_H: ToggleCaption;
+    SDLK_M: SelectMode(0);
+    SDLK_D: SelectMode(1);
+    SDLK_N: SelectMode(2);
+    SDLK_A: SelectMode(-1);
+    SDLK_1: SelectSeason(0);
+    SDLK_2: SelectSeason(1);
+    SDLK_3: SelectSeason(2);
+    SDLK_4: SelectSeason(3);
+  end;
+end;
+
+{ a game key: an engine pause (info window button) is lifted first }
+procedure TSDLView.GameKey(Code: Integer);
+begin
+  if Paused then Paused := False;
+  FScene.KeyInput(Code);
+  FDirty := True;
+end;
+
+{ SDL mouse positions are in window points; the frame is in pixels }
+procedure TSDLView.MouseEvent(Kind: Integer; X, Y: Single);
+var
+  W, H, PW, PH: LongInt;
+begin
+  W := 1; H := 1; PW := 1; PH := 1;
+  SDL_GetWindowSize(FWin, @W, @H);
+  SDL_GetWindowSizeInPixels(FWin, @PW, @PH);
+  if (Kind = 2) and Paused then Paused := False;
+  FScene.MouseInput(Kind, X * PW / Max(1, W), Y * PH / Max(1, H));
+  FDirty := True;
+end;
+
+procedure TSDLView.PollEvents;
+var
+  E: TSDL_Event;
+begin
+  while SDL_PollEvent(@E) do
+    case E._type of
+      SDL_EVENT_QUIT, SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        if not Exporting then
+        begin
+          FRunning := False;
+          Application.Terminate;
+        end;
+      SDL_EVENT_KEY_DOWN:
+        if not E.key._repeat or (FScene.TextEntry and (E.key.key = SDLK_BACKSPACE)) then HandleKey(E.key.key);
+      SDL_EVENT_TEXT_INPUT:
+        if FScene.TextEntry and (E.text.text <> nil) then
+        begin
+          FScene.TextInput(StrPas(E.text.text));
+          FDirty := True;
+        end;
+      SDL_EVENT_MOUSE_BUTTON_DOWN:
+        // only the left button clicks (menus and the wing beat); right / middle do nothing
+        if E.button.button = SDL_BUTTON_LEFT then MouseEvent(2, E.button.x, E.button.y);
+      SDL_EVENT_MOUSE_MOTION:
+        MouseEvent(1, E.motion.x, E.motion.y);
+      SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        UpdateRefreshRate;
+    end;
+end;
+
+{ Every band goes straight from its bitmap into the texture. BGRABitmap rows are
+  bottom-up on Windows: the bands are uploaded as they are into a texture that
+  is drawn vertically flipped. }
+procedure TSDLView.UploadFrame;
+var
+  I, W, H: Integer;
+  B: TBGRABitmap;
+  Rc: TSDL_Rect;
+  Fmt: TSDL_PixelFormat;
+begin
+  W := FRenderer.Width;
+  H := FRenderer.Height;
+  if (FTex = nil) or (FTexW <> W) or (FTexH <> H) then
+  begin
+    if FTex <> nil then SDL_DestroyTexture(FTex);
+    if TBGRAPixel_RGBAOrder then Fmt := SDL_PIXELFORMAT_ABGR8888 else Fmt := SDL_PIXELFORMAT_ARGB8888;
+    FTex := SDL_CreateTexture(FRen, Fmt, SDL_TEXTUREACCESS_STREAMING, W, H);
+    if FTex = nil then Exit;
+    SDL_SetTextureScaleMode(FTex, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureBlendMode(FTex, SDL_BLENDMODE_NONE);
+    FTexW := W;
+    FTexH := H;
+  end;
+  for I := 0 to FRenderer.BandCount - 1 do
+  begin
+    B := FRenderer.Bands[I];
+    FFlipV := B.LineOrder = riloBottomToTop;
+    Rc.x := 0;
+    Rc.w := W;
+    Rc.h := B.Height;
+    if FFlipV then
+      Rc.y := H - FRenderer.BandTops[I] - B.Height
+    else
+      Rc.y := FRenderer.BandTops[I];
+    SDL_UpdateTexture(FTex, @Rc, B.Data, W * SizeOf(TBGRAPixel));
+  end;
+end;
+
+procedure TSDLView.Present;
+var
+  W, H: LongInt;
+  Dst: TSDL_FRect;
+begin
+  if FTex = nil then
+  begin
+    SDL_SetRenderDrawColor(FRen, 244, 244, 242, 255);
+    SDL_RenderClear(FRen);
+  end
+  else
+  begin
+    W := 0;
+    H := 0;
+    SDL_GetCurrentRenderOutputSize(FRen, @W, @H);
+    Dst.x := 0;
+    Dst.y := 0;
+    Dst.w := W;
+    Dst.h := H;
+    if FFlipV then
+      SDL_RenderTextureRotated(FRen, FTex, nil, @Dst, 0, nil, SDL_FLIP_VERTICAL)
+    else
+      SDL_RenderTexture(FRen, FTex, nil, @Dst);
+  end;
+  SDL_RenderPresent(FRen);
+end;
+
+{ ---------- render loop ---------- }
+
+procedure TSDLView.AppIdle(Sender: TObject; var Done: Boolean);
+var
+  T0, Now, DT, Interval: Double;
+  W, H: LongInt;
+begin
+  Done := False;
+  if not FRunning or Exporting then
+  begin
+    Done := True;
+    Exit;
+  end;
+  PollEvents;
+  if not FRunning then Exit;
+  if (SDL_GetWindowFlags(FWin) and SDL_WINDOW_MINIMIZED) <> 0 then
+  begin
+    Sleep(15);
+    Exit;
+  end;
+
+
+  // 1. collect the frame the workers rendered during the last vsync wait
+  if FRenderer.Rendering then
+  begin
+    T0 := HiResMs;
+    FRenderer.Wait;
+    LastWaitMs := HiResMs - T0;
+    FHaveFrame := True;
+    FFresh := True;
+  end
+  else
+    LastWaitMs := 0;
+
+  // 2. size change: re-cut the static parts and sprites (sprites on all cores)
+  W := 0;
+  H := 0;
+  SDL_GetWindowSizeInPixels(FWin, @W, @H);
+  if (W >= 16) and (H >= 16) and ((W <> FRenderer.Width) or (H <> FRenderer.Height)) then
+  begin
+    FRenderer.SetSize(W, H);
+    FHaveFrame := False;
+  end;
+  if not FHaveFrame then
+  begin
+    FScene.Prepare;
+    FRenderer.Render;
+    FHaveFrame := True;
+    FFresh := True;
+  end;
+  if FSaveRequested then DoSave;
+
+  // 3. hand the finished frame to the GPU
+  T0 := HiResMs;
+  if FFresh then UploadFrame;
+  FFresh := False;
+  LastUploadMs := HiResMs - T0;
+
+  // 4. advance the animation and start the next frame on all cores
+  Now := HiResMs;
+  DT := (Now - FLastUpdate) / 1000;
+  FLastUpdate := Now;
+  if DT > 0.1 then DT := 0.1;
+  if (not FPaused) or FDirty then
+  begin
+    T0 := HiResMs;
+    if not FPaused then FScene.Update(DT);
+    FScene.Prepare;
+    ApplySceneRequests;
+    LastUpdateMs := HiResMs - T0;
+    FRenderer.Start;
+    FDirty := False;
+  end;
+
+  // 5. present; with vsync on this waits here for the display
+  T0 := HiResMs;
+  Present;
+  LastSwapMs := HiResMs - T0;
+
+  Now := HiResMs;
+  Interval := Now - FLastSwap;
+  FLastSwap := Now;
+  LastInterval := Interval;
+  if FrameCount > 0 then
+  begin
+    if Interval > 0 then
+      Fps := Fps * 0.95 + (1000 / Interval) * 0.05;
+    if FVSync and not FPaused and (Interval > 1.5 * 1000 / RefreshHz) then
+      Inc(MissedFrames);
+    if FBenchSecs > 0 then BenchFrame(Now, Interval);
+  end;
+  Inc(FrameCount);
+  // nothing moves while paused: sleep until the next message
+  if FPaused and not FDirty then
+  begin
+    Sleep(10);
+    Done := True;
+  end;
+end;
+
+{ ---------- --bench=SECONDS ---------- }
+
+procedure TSDLView.BenchFrame(ANow, AInterval: Double);
+begin
+  if FBenchT0 = 0 then FBenchT0 := ANow + 2000;  // 2 s warm-up
+  if ANow < FBenchT0 then Exit;
+  SetLength(FBench, Length(FBench) + 1);
+  FBench[High(FBench)] := AInterval;
+  if ANow - FBenchT0 >= FBenchSecs * 1000 then
+  begin
+    WriteBenchReport;
+    FRunning := False;
+    Application.Terminate;
+  end;
+end;
+
+procedure TSDLView.WriteBenchReport;
+var
+  SL: TStringList;
+  Sorted: array of Single;
+  I, J, N, Missed: Integer;
+  Sum, Budget: Double;
+  T: Single;
+begin
+  N := Length(FBench);
+  if N = 0 then Exit;
+  Sorted := Copy(FBench);
+  for I := 1 to N - 1 do
+  begin
+    T := Sorted[I];
+    J := I - 1;
+    while (J >= 0) and (Sorted[J] > T) do
+    begin
+      Sorted[J + 1] := Sorted[J];
+      Dec(J);
+    end;
+    Sorted[J + 1] := T;
+  end;
+  Sum := 0;
+  for I := 0 to N - 1 do Sum := Sum + FBench[I];
+  Budget := 1000 / Max(1, RefreshHz);
+  Missed := 0;
+  for I := 0 to N - 1 do
+    if FBench[I] > Budget * 1.5 then Inc(Missed);
+  SL := TStringList.Create;
+  try
+    SL.Add('Paper Crane SDL3 frame pacing  ' + FormatDateTime('yyyy-mm-dd hh:nn:ss', SysUtils.Now));
+    SL.Add(Format('%s, backend %s, vsync %s, display %s Hz', [GLVendor, GLRenderer,
+      IfThen(FVSync, 'on', 'off'), FormatFloat('0', RefreshHz)]));
+    SL.Add(Format('frame %d x %d, %d threads (%d physical / %d logical cores), %d bands',
+      [FRenderer.Width, FRenderer.Height, FRenderer.Threads, PhysicalCores,
+      TThread.ProcessorCount, FRenderer.BandCount]));
+    SL.Add(Format('presents %d in %.1f s  ->  %.2f fps', [N, Sum / 1000, N * 1000 / Sum]));
+    SL.Add(Format('interval ms: mean %.2f  median %.2f  p99 %.2f  max %.2f', [Sum / N,
+      Sorted[N div 2], Sorted[Min(N - 1, Round(N * 0.99))], Sorted[N - 1]]));
+    if FVSync then
+      SL.Add(Format('missed vblank (interval > 1.5 x %.2f ms): %d (%.2f %%)',
+        [Budget, Missed, Missed * 100 / N]))
+    else
+      SL.Add('vsync off: frames are presented as fast as the pipeline allows');
+    SL.Add(Format('render wall %.2f ms, cpu %.2f ms (smoothed); upload %.2f ms, present %.2f ms',
+      [FRenderer.WallSmooth, FRenderer.CpuSmooth, LastUploadMs, LastSwapMs]));
+    SL.SaveToFile(ChangeFileExt(ParamStr(0), '-bench.txt'));
+  finally
+    SL.Free;
+  end;
+end;
+
+{ ---------- controls ---------- }
+
+procedure TSDLView.SetPaused(AValue: Boolean);
+begin
+  FPaused := AValue;
+  FScene.ShowPause := AValue;  // the pause card
+  FLastUpdate := HiResMs;
+  FDirty := True;
+end;
+
+procedure TSDLView.Redraw;
+begin
+  FDirty := True;
+end;
+
+{ 0 summer, 1 rainy, 2 autumn, 3 winter: re-cuts the paper sheets in the next Prepare
+  (workers idle) and fades the old picture out; instant while paused. }
+procedure TSDLView.SelectSeason(ASeason: Integer);
+begin
+  FScene.SetSeason(ASeason, not FPaused);
+  FDirty := True;
+end;
+
+{ 0 morning, 1 day, 2 night: fades over FadeSeconds (instantly while paused);
+  -1 toggles the automatic morning -> day -> night cycle. }
+procedure TSDLView.SelectMode(AMode: Integer);
+begin
+  if AMode < 0 then
+    FScene.AutoCycle := not FScene.AutoCycle
+  else
+  begin
+    FScene.AutoCycle := False;
+    if FPaused then FScene.SetModeInstant(AMode) else FScene.SetMode(AMode);
+  end;
+  FDirty := True;
+end;
+
+procedure TSDLView.SetVSync(AValue: Boolean);
+begin
+  FVSync := AValue;
+  ApplyVSync;
+end;
+
+procedure TSDLView.SetThreads(N: Integer);
+begin
+  FRenderer.SetThreads(N);
+  FHaveFrame := False;
+  ResetStats;
+end;
+
+procedure TSDLView.SetBandsPerThread(N: Integer);
+begin
+  FRenderer.SetBandsPerThread(N);
+  FHaveFrame := False;
+  ResetStats;
+end;
+
+procedure TSDLView.SetAdaptive(AValue: Boolean);
+begin
+  FRenderer.Adaptive := AValue;
+  if not AValue then
+  begin
+    FRenderer.ResetBands;
+    FHaveFrame := False;
+  end;
+  ResetStats;
+end;
+
+procedure TSDLView.ResetStats;
+begin
+  MissedFrames := 0;
+end;
+
+procedure TSDLView.ToggleCaption;
+begin
+  FScene.ShowCaption := not FScene.ShowCaption;
+  Redraw;
+end;
+
+{ what the menus asked for: quit, full screen, vsync }
+procedure TSDLView.ApplySceneRequests;
+begin
+  if FScene.QuitRequested and FRunning then
+  begin
+    FRunning := False;
+    Application.Terminate;
+    Exit;
+  end;
+  if FScene.FullScreenWanted <> FFullScreen then ToggleFullScreen;
+  if FScene.VSyncWanted <> FVSync then SetVSync(FScene.VSyncWanted);
+end;
+
+procedure TSDLView.ToggleFullScreen;
+begin
+  FFullScreen := not FFullScreen;
+  FScene.FullScreenWanted := FFullScreen;
+  SDL_SetWindowFullscreen(FWin, FFullScreen);  // borderless desktop full screen
+end;
+
+procedure TSDLView.RequestSave;
+begin
+  FSaveRequested := True;
+end;
+
+procedure TSDLView.DoSave;
+var
+  B: TBGRABitmap;
+  FileName: string;
+begin
+  FSaveRequested := False;
+  B := TBGRABitmap.Create(1, 1);
+  try
+    FRenderer.Assemble(B);
+    FileName := ExtractFilePath(ParamStr(0)) + 'papercrane_' +
+      FormatDateTime('yyyymmdd_hhnnss', SysUtils.Now) + '.png';
+    B.SaveToFile(FileName);
+    LastSaved := FileName;
+  finally
+    B.Free;
+  end;
+end;
+
+
+function TSDLView.Left: Integer;
+var
+  X, Y: LongInt;
+begin
+  SDL_GetWindowPosition(FWin, @X, @Y);
+  Result := X;
+end;
+
+function TSDLView.Top: Integer;
+var
+  X, Y: LongInt;
+begin
+  SDL_GetWindowPosition(FWin, @X, @Y);
+  Result := Y;
+end;
+
+function TSDLView.Width: Integer;
+var
+  W, H: LongInt;
+begin
+  SDL_GetWindowSize(FWin, @W, @H);
+  Result := W;
+end;
+
+function TSDLView.Height: Integer;
+var
+  W, H: LongInt;
+begin
+  SDL_GetWindowSize(FWin, @W, @H);
+  Result := H;
+end;
+
+end.
